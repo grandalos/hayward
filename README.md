@@ -53,9 +53,7 @@ external_components:
       type: git
       url: https://github.com/grandalos/hayward
       ref: main
-      path: external_components
     components: [hayward]
-    refresh: 1d
 ```
 
 ## Example configuration
