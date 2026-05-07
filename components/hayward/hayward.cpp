@@ -765,8 +765,8 @@ void Hayward::publish_power_sensor_(sensor::Sensor *sensor) {
     return;
   }
 
-  const float converted =
-      static_cast<float>(*compressor_output_current) * static_cast<float>(*inverter_plate_ac_voltage);
+  const float converted = static_cast<float>(*compressor_output_current) * 0.1f *
+                          static_cast<float>(*inverter_plate_ac_voltage);
   if (!sensor->has_state() || std::fabs(sensor->state - converted) > 0.5f) {
     sensor->publish_state(converted);
   }
