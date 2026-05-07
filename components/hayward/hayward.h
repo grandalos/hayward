@@ -178,6 +178,7 @@ class Hayward : public Component, public uart::UARTDevice {
   }
 
   void set_target_temperature_sensor(sensor::Sensor *sensor) { this->target_temperature_sensor_ = sensor; }
+  void set_power_sensor(sensor::Sensor *sensor) { this->power_sensor_ = sensor; }
   void set_suction_temperature_sensor(sensor::Sensor *sensor) { this->suction_temperature_sensor_ = sensor; }
   void set_inlet_temperature_sensor(sensor::Sensor *sensor) { this->inlet_temperature_sensor_ = sensor; }
   void set_outlet_temperature_sensor(sensor::Sensor *sensor) { this->outlet_temperature_sensor_ = sensor; }
@@ -246,6 +247,7 @@ class Hayward : public Component, public uart::UARTDevice {
 
   void publish_temperature_sensor_(sensor::Sensor *sensor, uint16_t address);
   void publish_scaled_sensor_(sensor::Sensor *sensor, uint16_t address, float scale);
+  void publish_power_sensor_(sensor::Sensor *sensor);
   void publish_bcd_sensor_(sensor::Sensor *sensor, uint16_t address);
   void publish_binary_sensor_(binary_sensor::BinarySensor *sensor, bool value);
   void publish_text_sensor_(text_sensor::TextSensor *sensor, const std::string &value);
@@ -313,6 +315,7 @@ class Hayward : public Component, public uart::UARTDevice {
   HaywardNumber *power_off_hour_number_{nullptr};
 
   sensor::Sensor *target_temperature_sensor_{nullptr};
+  sensor::Sensor *power_sensor_{nullptr};
   sensor::Sensor *silent_schedule_start_hour_sensor_{nullptr};
   sensor::Sensor *silent_schedule_stop_hour_sensor_{nullptr};
   sensor::Sensor *suction_temperature_sensor_{nullptr};

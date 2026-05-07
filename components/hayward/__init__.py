@@ -32,6 +32,7 @@ CONF_CTRL_CLIMATE = "ctrl_climate"
 CONF_FRAME_TIMEOUT = "frame_timeout"
 CONF_SEND_WRITES = "send_writes"
 CONF_DIAG_POWER_STATE = "diag_power_state"
+CONF_DIAG_POWER = "diag_power"
 CONF_DIAG_MODE = "diag_mode"
 CONF_DIAG_PANEL_CLOCK = "diag_panel_clock"
 CONF_DIAG_SILENT_SCHEDULE_WINDOW = "diag_silent_schedule_window"
@@ -126,6 +127,14 @@ CONFIG_SCHEMA = (
                 device_class=DEVICE_CLASS_POWER,
                 entity_category=ENTITY_CATEGORY_DIAGNOSTIC,
                 icon=ICON_POWER,
+            ),
+            cv.Optional(CONF_DIAG_POWER): sensor.sensor_schema(
+                unit_of_measurement="W",
+                icon=ICON_FLASH,
+                accuracy_decimals=0,
+                device_class=DEVICE_CLASS_POWER,
+                state_class=STATE_CLASS_MEASUREMENT,
+                entity_category=ENTITY_CATEGORY_DIAGNOSTIC,
             ),
             cv.Optional(CONF_DIAG_MODE): text_sensor.text_sensor_schema(
                 entity_category=ENTITY_CATEGORY_DIAGNOSTIC,
@@ -341,6 +350,7 @@ async def to_code(config):
 
     sensor_setters = {
         CONF_DIAG_TARGET_TEMPERATURE: "set_target_temperature_sensor",
+        CONF_DIAG_POWER: "set_power_sensor",
         CONF_DIAG_SILENT_SCHEDULE_START_HOUR: "set_silent_schedule_start_hour_sensor",
         CONF_DIAG_SILENT_SCHEDULE_STOP_HOUR: "set_silent_schedule_stop_hour_sensor",
         CONF_DIAG_SUCTION_TEMPERATURE: "set_suction_temperature_sensor",

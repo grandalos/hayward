@@ -235,6 +235,7 @@ void Hayward::dump_config() {
   LOG_SENSOR("  ", "Panel Second", this->panel_second_sensor_);
   LOG_SENSOR("  ", "Power On Hour", this->power_on_hour_sensor_);
   LOG_SENSOR("  ", "Power Off Hour", this->power_off_hour_sensor_);
+  LOG_SENSOR("  ", "Power", this->power_sensor_);
   LOG_TEXT_SENSOR("  ", "Panel Clock", this->panel_clock_text_sensor_);
   LOG_TEXT_SENSOR("  ", "Switch Flags Text", this->switch_flags_text_sensor_);
   LOG_TEXT_SENSOR("  ", "Silent Schedule Window", this->silent_schedule_window_text_sensor_);
@@ -625,6 +626,7 @@ optional<uint16_t> Hayward::get_register_(uint16_t address) const {
 
 void Hayward::publish_entities_() {
   this->publish_temperature_sensor_(this->target_temperature_sensor_, REG_TARGET_TEMPERATURE);
+  this->publish_power_sensor_(this->power_sensor_);
   this->publish_scaled_sensor_(this->silent_schedule_start_hour_sensor_, REG_SILENT_SCHEDULE_START_HOUR, 1.0f);
   this->publish_scaled_sensor_(this->silent_schedule_stop_hour_sensor_, REG_SILENT_SCHEDULE_STOP_HOUR, 1.0f);
   this->publish_temperature_sensor_(this->suction_temperature_sensor_, REG_SUCTION_TEMPERATURE);
@@ -748,6 +750,24 @@ void Hayward::publish_scaled_sensor_(sensor::Sensor *sensor, uint16_t address, f
 
   const float converted = static_cast<float>(*value) * scale;
   if (!sensor->has_state() || std::fabs(sensor->state - converted) > 0.05f) {
+    sensor->publish_state(converted);
+  }
+}
+
+void Hayward::publish_power_sensor_(sensor::Sensor *sensor) {
+  if (sensor == nullptr) {
+    return;
+  }
+
+  auto compressor_output_current = this->get_register_(REG_COMPRESSOR_OUTPUT_CURRENT);
+  auto inverter_plate_ac_voltage = this->get_register_(REG_INVERTER_PLATE_AC_VOLTAGE);
+  if (!compressor_output_current.has_value() || !inverter_plate_ac_voltage.has_value()) {
+    return;
+  }
+
+  const float converted =
+      static_cast<float>(*compressor_output_current) * static_cast<float>(*inverter_plate_ac_voltage);
+  if (!sensor->has_state() || std::fabs(sensor->state - converted) > 0.5f) {
     sensor->publish_state(converted);
   }
 }
