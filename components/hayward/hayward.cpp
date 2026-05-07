@@ -15,6 +15,7 @@ static const char *const TAG = "hayward";
 
 static std::string join_strings_(const std::vector<std::string> &parts) {
   if (parts.empty()) {
+    
     return "none";
   }
   std::ostringstream out;
@@ -1042,7 +1043,7 @@ void Hayward::publish_climate_() {
 
 bool Hayward::maybe_respond_to_controller_read_(const PendingRead &request) {
   const bool supported_range =
-      (request.start_address == STATUS_START && request.register_count == STATUS_COUNT) ||
+      (request.start_address == STATUS_START && (request.register_count == STATUS_COUNT || request.register_count == 30U)) ||
       (request.start_address == SETTINGS_START && request.register_count == SETTINGS_COUNT) ||
       (request.start_address == EXTRA_SETTINGS_START && request.register_count == EXTRA_SETTINGS_COUNT);
   if (!supported_range) {
