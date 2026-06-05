@@ -241,13 +241,14 @@ class Hayward : public Component, public uart::UARTDevice {
   uint16_t build_status_register_(uint16_t address);
   void update_block_tracking_(uint16_t address);
   void update_clock_seed_();
+  bool apply_delivered_settings_to_status_cache_();
   bool apply_climate_mode_(climate::ClimateMode mode);
   bool apply_target_temperature_(float target_temperature);
   bool apply_climate_preset_(const optional<climate::ClimatePreset> &preset);
 
-  void publish_temperature_sensor_(sensor::Sensor *sensor, uint16_t address);
-  void publish_scaled_sensor_(sensor::Sensor *sensor, uint16_t address, float scale);
-  void publish_power_sensor_(sensor::Sensor *sensor);
+  void publish_temperature_sensor_(sensor::Sensor *sensor, uint16_t address, bool is_off = false);
+  void publish_scaled_sensor_(sensor::Sensor *sensor, uint16_t address, float scale, bool is_off = false);
+  void publish_power_sensor_(sensor::Sensor *sensor, bool is_off = false);
   void publish_bcd_sensor_(sensor::Sensor *sensor, uint16_t address);
   void publish_binary_sensor_(binary_sensor::BinarySensor *sensor, bool value);
   void publish_text_sensor_(text_sensor::TextSensor *sensor, const std::string &value);
@@ -258,6 +259,7 @@ class Hayward : public Component, public uart::UARTDevice {
                            text_sensor::TextSensor *time_sensor);
   void publish_schedule_window_(uint16_t start_address, uint16_t stop_address, text_sensor::TextSensor *window_sensor);
   void publish_mode_text_();
+  void log_debug_counters_();
   uint16_t decode_bcd_(uint16_t value) const;
   optional<uint16_t> get_decoded_bcd_register_(uint16_t address) const;
   std::string format_hour_(uint16_t hour) const;
@@ -282,6 +284,18 @@ class Hayward : public Component, public uart::UARTDevice {
   uint16_t clock_seed_hour_bcd_{0};
   uint16_t clock_seed_minute_bcd_{0};
   uint16_t clock_seed_second_bcd_{0};
+  uint32_t debug_next_status_ms_{0};
+  uint32_t rx_bytes_total_{0};
+  uint32_t parsed_frames_total_{0};
+  uint32_t crc_errors_total_{0};
+  uint32_t dropped_partial_frames_total_{0};
+  uint32_t controller_read_requests_total_{0};
+  uint32_t unsupported_controller_reads_total_{0};
+  uint32_t served_reads_total_{0};
+  uint32_t last_rx_ms_{0};
+  uint32_t last_frame_ms_{0};
+  uint32_t last_controller_read_ms_{0};
+  uint32_t last_served_read_ms_{0};
 
   binary_sensor::BinarySensor *power_state_binary_sensor_{nullptr};
   binary_sensor::BinarySensor *silent_active_binary_sensor_{nullptr};

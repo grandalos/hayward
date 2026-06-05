@@ -12,6 +12,7 @@ namespace esphome::hayward {
 using namespace esphome::hayward::protocol;
 
 static const char *const TAG = "hayward";
+static constexpr uint32_t RESPONSE_TURNAROUND_DELAY_MS = 5;
 
 static std::string join_strings_(const std::vector<std::string> &parts) {
   if (parts.empty()) {
@@ -161,7 +162,7 @@ climate::ClimateTraits HaywardClimate::traits() {
 
 void Hayward::setup() {
   this->check_uart_settings(9600, 1, uart::UART_CONFIG_PARITY_NONE, 8);
-  this->set_rx_full_threshold(8);
+  this->set_rx_full_threshold(1);
 }
 
 void Hayward::loop() {
@@ -173,6 +174,8 @@ void Hayward::loop() {
       break;
     }
     this->rx_buffer_.push_back(byte);
+    this->rx_bytes_total_++;
+    this->last_rx_ms_ = millis();
     this->last_byte_ms_ = now;
 
     while (this->try_parse_buffer_()) {
@@ -181,6 +184,7 @@ void Hayward::loop() {
 
   if (!this->rx_buffer_.empty() && now - this->last_byte_ms_ > this->frame_timeout_ms_) {
     ESP_LOGV(TAG, "Dropping partial frame with %zu bytes after timeout", this->rx_buffer_.size());
+    this->dropped_partial_frames_total_++;
     this->rx_buffer_.clear();
   }
 
@@ -280,8 +284,15 @@ bool Hayward::send_emulated_read_response_(uint8_t target_address, uint8_t funct
   const uint16_t crc = this->crc16_(frame.data(), frame.size());
   frame.push_back(static_cast<uint8_t>(crc & 0xFF));
   frame.push_back(static_cast<uint8_t>(crc >> 8));
+
+  // Keep the Modbus RTU frame boundary explicit instead of relying on debug logging latency.
+  delay(RESPONSE_TURNAROUND_DELAY_MS);
   this->write_array(frame);
-  this->flush();
+  const auto flush_result = this->flush();
+  if (flush_result != uart::UARTFlushResult::UART_FLUSH_RESULT_SUCCESS &&
+      flush_result != uart::UARTFlushResult::UART_FLUSH_RESULT_ASSUMED_SUCCESS) {
+    ESP_LOGW(TAG, "UART flush after emulated read failed: result=%d", static_cast<int>(flush_result));
+  }
   ESP_LOGD(TAG, "Served emulated read: addr=0x%02X fc=0x%02X start=%u count=%zu", target_address, function_code,
            start_address, values.size());
   return true;
@@ -347,6 +358,12 @@ bool Hayward::apply_target_temperature_(float target_temperature) {
     case climate::CLIMATE_MODE_AUTO:
       changed |= this->stage_register_write_(REG_SAVED_AUTO_TEMPERATURE, raw_target, "save auto target");
       break;
+    case climate::CLIMATE_MODE_OFF:
+      // When off, save to all mode slots so it persists regardless of next mode
+      changed |= this->stage_register_write_(REG_SAVED_COOL_TEMPERATURE, raw_target, "save cool target (off)");
+      changed |= this->stage_register_write_(REG_SAVED_HEAT_TEMPERATURE, raw_target, "save heat target (off)");
+      changed |= this->stage_register_write_(REG_SAVED_AUTO_TEMPERATURE, raw_target, "save auto target (off)");
+      break;
     default:
       break;
   }
@@ -386,12 +403,15 @@ bool Hayward::try_parse_buffer_() {
 
   if (!this->validate_crc_(this->rx_buffer_.data(), frame_len)) {
     ESP_LOGW(TAG, "CRC mismatch while decoding frame, dropping one byte to resync");
+    this->crc_errors_total_++;
     this->rx_buffer_.erase(this->rx_buffer_.begin());
     return true;
   }
 
   std::vector<uint8_t> frame(this->rx_buffer_.begin(), this->rx_buffer_.begin() + frame_len);
   this->rx_buffer_.erase(this->rx_buffer_.begin(), this->rx_buffer_.begin() + frame_len);
+  this->parsed_frames_total_++;
+  this->last_frame_ms_ = millis();
   this->handle_frame_(frame);
   return !this->rx_buffer_.empty();
 }
@@ -526,6 +546,10 @@ void Hayward::handle_read_request_(const std::vector<uint8_t> &frame) {
   request.register_count = static_cast<uint16_t>(frame[4] << 8) | frame[5];
   request.timestamp_ms = millis();
   this->pending_reads_[request.address] = request;
+  if (request.address == this->controller_address_) {
+    this->controller_read_requests_total_++;
+    this->last_controller_read_ms_ = request.timestamp_ms;
+  }
   ESP_LOGV(TAG, "Read request addr=0x%02X fc=0x%02X start=%u count=%u", request.address, request.function_code,
            request.start_address, request.register_count);
   if (this->send_writes_ && request.address == this->controller_address_ &&
@@ -565,6 +589,13 @@ void Hayward::handle_write_single_request_(const std::vector<uint8_t> &frame) {
   const uint16_t value = static_cast<uint16_t>(frame[4] << 8) | frame[5];
   ESP_LOGV(TAG, "Write single addr=0x%02X reg=%u value=0x%04X (%u)", frame[0], address, value, value);
   this->update_register_cache_(address, value);
+
+  // Send ACK (echo the request frame back)
+  if (frame[0] != this->broadcast_address_) {
+    this->write_array(frame);
+    this->flush();
+  }
+
   this->publish_entities_();
 }
 
@@ -582,6 +613,16 @@ void Hayward::handle_write_multiple_request_(const std::vector<uint8_t> &frame) 
     const size_t offset = 7 + index * 2;
     const uint16_t value = static_cast<uint16_t>(frame[offset] << 8) | frame[offset + 1];
     this->update_register_cache_(start_address + index, value);
+  }
+
+  // Send ACK (first 6 bytes of request + CRC)
+  if (frame[0] != this->broadcast_address_) {
+    std::vector<uint8_t> ack(frame.begin(), frame.begin() + 6);
+    const uint16_t crc = this->crc16_(ack.data(), ack.size());
+    ack.push_back(static_cast<uint8_t>(crc & 0xFF));
+    ack.push_back(static_cast<uint8_t>(crc >> 8));
+    this->write_array(ack);
+    this->flush();
   }
 
   this->publish_entities_();
@@ -624,9 +665,42 @@ optional<uint16_t> Hayward::get_register_(uint16_t address) const {
   return it->second;
 }
 
+bool Hayward::apply_delivered_settings_to_status_cache_() {
+  bool changed = false;
+
+  optional<uint16_t> power = this->get_register_(REG_POWER_COMMAND);
+  if (!power.has_value()) {
+    power = this->get_register_(REG_POWER_COMMAND_2);
+  }
+  if (power.has_value()) {
+    auto power_status = this->get_register_(REG_POWER_STATUS);
+    if (!power_status.has_value() || *power_status != *power) {
+      this->update_register_cache_(REG_POWER_STATUS, *power);
+      changed = true;
+    }
+  }
+
+  if (auto mode = this->get_register_(REG_MODE_COMMAND); mode.has_value()) {
+    auto mode_status = this->get_register_(REG_MODE_STATUS);
+    if (!mode_status.has_value() || *mode_status != *mode) {
+      this->update_register_cache_(REG_MODE_STATUS, *mode);
+      changed = true;
+    }
+  }
+
+  return changed;
+}
+
 void Hayward::publish_entities_() {
+  bool is_off = false;
+  if (auto power = this->get_register_(REG_POWER_STATUS); power.has_value()) {
+    is_off = (*power == 0U);
+  } else if (auto power = this->get_register_(REG_POWER_COMMAND); power.has_value()) {
+    is_off = (*power == 0U);
+  }
+
   this->publish_temperature_sensor_(this->target_temperature_sensor_, REG_TARGET_TEMPERATURE);
-  this->publish_power_sensor_(this->power_sensor_);
+  this->publish_power_sensor_(this->power_sensor_, is_off);
   this->publish_scaled_sensor_(this->silent_schedule_start_hour_sensor_, REG_SILENT_SCHEDULE_START_HOUR, 1.0f);
   this->publish_scaled_sensor_(this->silent_schedule_stop_hour_sensor_, REG_SILENT_SCHEDULE_STOP_HOUR, 1.0f);
   this->publish_temperature_sensor_(this->suction_temperature_sensor_, REG_SUCTION_TEMPERATURE);
@@ -635,14 +709,13 @@ void Hayward::publish_entities_() {
   this->publish_temperature_sensor_(this->coil_temperature_sensor_, REG_COIL_TEMPERATURE);
   this->publish_temperature_sensor_(this->ambient_temperature_sensor_, REG_AMBIENT_TEMPERATURE);
   this->publish_temperature_sensor_(this->exhaust_temperature_sensor_, REG_EXHAUST_TEMPERATURE);
-  this->publish_scaled_sensor_(this->compressor_current_sensor_, REG_COMPRESSOR_CURRENT, 0.1f);
-  this->publish_scaled_sensor_(this->compressor_output_current_sensor_, REG_COMPRESSOR_OUTPUT_CURRENT, 0.1f);
-  this->publish_scaled_sensor_(this->ac_fan_output_sensor_, REG_AC_FAN_OUTPUT, 1.0f);
-  this->publish_temperature_sensor_(this->super_heat_sensor_, REG_SUPER_HEAT);
-  this->publish_scaled_sensor_(this->target_speed_fan_motor_sensor_, REG_TARGET_SPEED_FAN_MOTOR, 1.0f);
-  this->publish_temperature_sensor_(this->over_heat_after_commpen_sensor_, REG_OVER_HEAT_AFTER_COMMPEN);
-  this->publish_scaled_sensor_(this->inverter_plate_ac_voltage_sensor_, REG_INVERTER_PLATE_AC_VOLTAGE, 1.0f);
-  this->publish_scaled_sensor_(this->speed_fan_motor_1_sensor_, REG_SPEED_FAN_MOTOR_1, 1.0f);
+  this->publish_scaled_sensor_(this->compressor_current_sensor_, REG_COMPRESSOR_CURRENT, 0.1f, is_off);
+  this->publish_scaled_sensor_(this->compressor_output_current_sensor_, REG_COMPRESSOR_OUTPUT_CURRENT, 0.1f, is_off);
+  this->publish_scaled_sensor_(this->ac_fan_output_sensor_, REG_AC_FAN_OUTPUT, 1.0f, is_off);
+  this->publish_temperature_sensor_(this->super_heat_sensor_, REG_SUPER_HEAT, is_off);
+  this->publish_scaled_sensor_(this->target_speed_fan_motor_sensor_, REG_TARGET_SPEED_FAN_MOTOR, 1.0f, is_off);
+  this->publish_temperature_sensor_(this->over_heat_after_commpen_sensor_, REG_OVER_HEAT_AFTER_COMMPEN, is_off);
+  this->publish_scaled_sensor_(this->speed_fan_motor_1_sensor_, REG_SPEED_FAN_MOTOR_1, 1.0f, is_off);
   this->publish_scaled_sensor_(this->pressure_sensor_, REG_PRESSURE_SENSOR, 0.1f);
   this->publish_scaled_sensor_(this->switch_flags_sensor_, REG_SWITCH_FLAGS, 1.0f);
   this->publish_scaled_sensor_(this->failure_flags_sensor_, REG_FAILURE_FLAGS, 1.0f);
@@ -657,22 +730,19 @@ void Hayward::publish_entities_() {
   this->publish_scaled_sensor_(this->power_on_hour_sensor_, REG_POWER_ON_HOUR, 1.0f);
   this->publish_scaled_sensor_(this->power_off_hour_sensor_, REG_POWER_OFF_HOUR, 1.0f);
 
-  if (auto power = this->get_register_(REG_POWER_STATUS); power.has_value()) {
-    this->publish_binary_sensor_(this->power_state_binary_sensor_, *power != 0U);
-  } else if (auto power = this->get_register_(REG_POWER_COMMAND); power.has_value()) {
-    this->publish_binary_sensor_(this->power_state_binary_sensor_, *power != 0U);
-  }
+  this->publish_binary_sensor_(this->power_state_binary_sensor_, !is_off);
 
   this->publish_toggle_entities_(REG_SILENT_ACTIVE, this->silent_active_binary_sensor_, this->silent_active_switch_);
   this->publish_toggle_entities_(REG_SILENT_SCHEDULE_ACTIVE, this->silent_schedule_active_binary_sensor_,
                                  this->silent_schedule_active_switch_);
 
   if (auto outputs = this->get_register_(REG_OUTPUT_FLAGS); outputs.has_value()) {
-    this->publish_binary_sensor_(this->compressor_running_binary_sensor_, (*outputs & 0x0001U) != 0U);
-    this->publish_binary_sensor_(this->water_pump_active_binary_sensor_, (*outputs & 0x0002U) != 0U);
-    this->publish_binary_sensor_(this->four_way_valve_active_binary_sensor_, (*outputs & 0x0004U) != 0U);
-    this->publish_binary_sensor_(this->fan_high_active_binary_sensor_, (*outputs & 0x0008U) != 0U);
-    this->publish_binary_sensor_(this->fan_low_active_binary_sensor_, (*outputs & 0x0010U) != 0U);
+    const uint16_t flags = is_off ? 0U : *outputs;
+    this->publish_binary_sensor_(this->compressor_running_binary_sensor_, (flags & 0x0001U) != 0U);
+    this->publish_binary_sensor_(this->water_pump_active_binary_sensor_, (flags & 0x0002U) != 0U);
+    this->publish_binary_sensor_(this->four_way_valve_active_binary_sensor_, (flags & 0x0004U) != 0U);
+    this->publish_binary_sensor_(this->fan_high_active_binary_sensor_, (flags & 0x0008U) != 0U);
+    this->publish_binary_sensor_(this->fan_low_active_binary_sensor_, (flags & 0x0010U) != 0U);
   }
 
   if (auto failures = this->get_register_(REG_FAILURE_FLAGS); failures.has_value()) {
@@ -724,10 +794,18 @@ void Hayward::publish_entities_() {
   this->publish_mode_text_();
 }
 
-void Hayward::publish_temperature_sensor_(sensor::Sensor *sensor, uint16_t address) {
+void Hayward::publish_temperature_sensor_(sensor::Sensor *sensor, uint16_t address, bool is_off) {
   if (sensor == nullptr) {
     return;
   }
+
+  if (is_off) {
+    if (!sensor->has_state() || sensor->state != 0.0f) {
+      sensor->publish_state(0.0f);
+    }
+    return;
+  }
+
   auto value = this->get_register_(address);
   if (!value.has_value() || *value == 0xFFFFU) {
     return;
@@ -739,10 +817,18 @@ void Hayward::publish_temperature_sensor_(sensor::Sensor *sensor, uint16_t addre
   }
 }
 
-void Hayward::publish_scaled_sensor_(sensor::Sensor *sensor, uint16_t address, float scale) {
+void Hayward::publish_scaled_sensor_(sensor::Sensor *sensor, uint16_t address, float scale, bool is_off) {
   if (sensor == nullptr) {
     return;
   }
+
+  if (is_off) {
+    if (!sensor->has_state() || sensor->state != 0.0f) {
+      sensor->publish_state(0.0f);
+    }
+    return;
+  }
+
   auto value = this->get_register_(address);
   if (!value.has_value()) {
     return;
@@ -754,8 +840,15 @@ void Hayward::publish_scaled_sensor_(sensor::Sensor *sensor, uint16_t address, f
   }
 }
 
-void Hayward::publish_power_sensor_(sensor::Sensor *sensor) {
+void Hayward::publish_power_sensor_(sensor::Sensor *sensor, bool is_off) {
   if (sensor == nullptr) {
+    return;
+  }
+
+  if (is_off) {
+    if (!sensor->has_state() || sensor->state != 0.0f) {
+      sensor->publish_state(0.0f);
+    }
     return;
   }
 
@@ -855,6 +948,16 @@ void Hayward::publish_mode_text_() {
     return;
   }
 
+  optional<uint16_t> power_register = this->get_register_(REG_POWER_STATUS);
+  if (!power_register.has_value()) {
+    power_register = this->get_register_(REG_POWER_COMMAND);
+  }
+
+  if (power_register.has_value() && *power_register == 0U) {
+    this->publish_text_sensor_(this->mode_text_sensor_, "off");
+    return;
+  }
+
   optional<uint16_t> mode_register = this->get_register_(REG_MODE_STATUS);
   if (!mode_register.has_value()) {
     mode_register = this->get_register_(REG_MODE_COMMAND);
@@ -880,6 +983,25 @@ void Hayward::publish_mode_text_() {
       this->publish_text_sensor_(this->mode_text_sensor_, "unknown");
       break;
   }
+}
+
+void Hayward::log_debug_counters_() {
+  const uint32_t now = millis();
+  auto age_or_never = [now](uint32_t timestamp) -> int32_t {
+    if (timestamp == 0U) {
+      return -1;
+    }
+    return static_cast<int32_t>(now - timestamp);
+  };
+  ESP_LOGI(TAG,
+           "UART stats: bytes=%u frames=%u crc_errors=%u dropped=%u rx_buf=%zu pending_reads=%zu ctrl_reads=%u "
+           "unsupported_ctrl_reads=%u served=%u last_rx_age_ms=%d last_frame_age_ms=%d last_ctrl_read_age_ms=%d "
+           "last_served_age_ms=%d",
+           this->rx_bytes_total_, this->parsed_frames_total_, this->crc_errors_total_,
+           this->dropped_partial_frames_total_, this->rx_buffer_.size(), this->pending_reads_.size(),
+           this->controller_read_requests_total_, this->unsupported_controller_reads_total_, this->served_reads_total_,
+           age_or_never(this->last_rx_ms_), age_or_never(this->last_frame_ms_),
+           age_or_never(this->last_controller_read_ms_), age_or_never(this->last_served_read_ms_));
 }
 
 uint16_t Hayward::decode_bcd_(uint16_t value) const {
@@ -923,8 +1045,11 @@ void Hayward::publish_climate_() {
     }
   }
 
+  const uint32_t now = millis();
+  const bool settings_applying =
+      now < this->settings_applying_until_ms_ || now < this->extra_settings_applying_until_ms_;
   const bool use_staged_control_state =
-      !this->send_writes_ || this->pending_settings_update_ || this->pending_extra_settings_update_;
+      !this->send_writes_ || this->pending_settings_update_ || this->pending_extra_settings_update_ || settings_applying;
   climate::ClimateMode new_mode = climate::CLIMATE_MODE_OFF;
   bool have_mode = false;
 
@@ -1022,12 +1147,10 @@ void Hayward::publish_climate_() {
   if (auto outputs = this->get_register_(REG_OUTPUT_FLAGS); outputs.has_value()) {
     compressor_active = (*outputs & 0x0001U) != 0U;
   }
-  if (!compressor_active) {
-    if (new_mode == climate::CLIMATE_MODE_OFF) {
-      new_action = climate::CLIMATE_ACTION_OFF;
-    } else {
-      new_action = climate::CLIMATE_ACTION_IDLE;
-    }
+  if (new_mode == climate::CLIMATE_MODE_OFF) {
+    new_action = climate::CLIMATE_ACTION_OFF;
+  } else if (!compressor_active) {
+    new_action = climate::CLIMATE_ACTION_IDLE;
   } else {
     auto inlet = this->get_register_(REG_INLET_TEMPERATURE);
     auto outlet = this->get_register_(REG_OUTLET_TEMPERATURE);
@@ -1062,11 +1185,15 @@ void Hayward::publish_climate_() {
 }
 
 bool Hayward::maybe_respond_to_controller_read_(const PendingRead &request) {
-  const bool supported_range =
-      (request.start_address == STATUS_START && (request.register_count == STATUS_COUNT || request.register_count == 30U)) ||
-      (request.start_address == SETTINGS_START && request.register_count == SETTINGS_COUNT) ||
-      (request.start_address == EXTRA_SETTINGS_START && request.register_count == EXTRA_SETTINGS_COUNT);
-  if (!supported_range) {
+  const bool is_settings = request.start_address >= SETTINGS_START && 
+                          (request.start_address + request.register_count) <= (SETTINGS_START + SETTINGS_COUNT);
+  const bool is_extra = request.start_address >= EXTRA_SETTINGS_START && 
+                       (request.start_address + request.register_count) <= (EXTRA_SETTINGS_START + EXTRA_SETTINGS_COUNT);
+  const bool is_status = request.start_address >= STATUS_START && 
+                        (request.start_address + request.register_count) <= (STATUS_START + STATUS_COUNT);
+
+  if (!is_settings && !is_extra && !is_status) {
+    this->unsupported_controller_reads_total_++;
     ESP_LOGV(TAG, "Ignoring controller read outside emulated ranges: start=%u count=%u", request.start_address,
              request.register_count);
     return false;
@@ -1078,23 +1205,35 @@ bool Hayward::maybe_respond_to_controller_read_(const PendingRead &request) {
     return false;
   }
 
-  if (request.start_address == SETTINGS_START) {
-    if (this->pending_settings_update_) {
-      ESP_LOGI(TAG, "Delivered staged settings to PC1002: start=%u count=%u", request.start_address,
-               request.register_count);
-    }
+  bool delivered_settings_update = false;
+  bool delivered_extra_settings_update = false;
+
+  if (is_settings && this->pending_settings_update_) {
+    ESP_LOGI(TAG, "Delivered staged settings to PC1002: start=%u count=%u", request.start_address,
+             request.register_count);
+    delivered_settings_update = true;
     this->pending_settings_update_ = false;
     this->settings_applying_until_ms_ = millis() + 3000U;
-  } else if (request.start_address == EXTRA_SETTINGS_START) {
-    if (this->pending_extra_settings_update_) {
-      ESP_LOGI(TAG, "Delivered staged extra settings to PC1002: start=%u count=%u", request.start_address,
-               request.register_count);
-    }
+  } else if (is_extra && this->pending_extra_settings_update_) {
+    ESP_LOGI(TAG, "Delivered staged extra settings to PC1002: start=%u count=%u", request.start_address,
+             request.register_count);
+    delivered_extra_settings_update = true;
     this->pending_extra_settings_update_ = false;
     this->extra_settings_applying_until_ms_ = millis() + 3000U;
   }
 
-  return this->send_emulated_read_response_(request.address, request.function_code, request.start_address, values);
+  const bool served = this->send_emulated_read_response_(request.address, request.function_code, request.start_address, values);
+  if (served) {
+    this->served_reads_total_++;
+    this->last_served_read_ms_ = millis();
+    if (delivered_settings_update) {
+      this->apply_delivered_settings_to_status_cache_();
+      this->publish_entities_();
+    } else if (delivered_extra_settings_update) {
+      this->publish_entities_();
+    }
+  }
+  return served;
 }
 
 std::vector<uint16_t> Hayward::build_register_block_(uint16_t start_address, uint16_t register_count) {
@@ -1126,11 +1265,8 @@ uint16_t Hayward::build_status_register_(uint16_t address) {
       return FLAG_EXTRA_SETTINGS_UPDATE;
     }
     const uint32_t now = millis();
-    if (now < this->settings_applying_until_ms_) {
+    if (now < this->settings_applying_until_ms_ || now < this->extra_settings_applying_until_ms_) {
       return FLAG_SETTINGS_APPLYING;
-    }
-    if (now < this->extra_settings_applying_until_ms_) {
-      return FLAG_EXTRA_SETTINGS_UPDATE;
     }
     if (!this->has_settings_snapshot_ || !this->has_extra_settings_snapshot_) {
       return FLAG_NEEDS_UPDATES;

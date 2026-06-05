@@ -8,8 +8,8 @@ This repository avoids a custom ESPHome fork. The integration is implemented as 
 
 ## Compatibility
 
-- supported ESPHome version: up to `2026.2.4`
-- newer ESPHome releases were tested during development and are currently not considered stable for this component
+- supported ESPHome version: current (`2026.5.2` and newer)
+- the component is fully compatible with the latest ESPHome releases
 
 ## Background
 
@@ -20,7 +20,7 @@ This implementation was built from:
 - analysis of the original fork by cleontin: [github.com/cleontin/esphome](https://github.com/cleontin/esphome)
 - the related write-up by Leontin: [leontin.eu/posts/hayward](https://www.leontin.eu/posts/hayward/)
 
-The current code does not reuse the fork directly, but the control model intentionally follows the same protocol idea where it matters.
+The current code does not reuse the fork directly, but the control model intentionally follows the same protocol idea where it matters. Recent updates (June 2026) fixed protocol stalling issues, temperature persistence when OFF, and ESPHome UART compatibility.
 
 ## Architecture
 
